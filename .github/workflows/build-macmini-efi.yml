@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: dortania/OpenCore-Legacy-Patcher
-          # Commit del tag 2.5.1: incluye payloads, OpenCore 1.0.4 y ocvalidate.
+          # Tag 2.5.1: sus binarios son OpenCore 1.0.6; constants.py dice 1.0.4.
           ref: f40057a5292f4804b51bcfe78d5047c7302a6434
           path: oclp-src
           persist-credentials: false
@@ -46,6 +46,7 @@ jobs:
           sw_vers | tee diagnostico/runner.txt
           python --version | tee -a diagnostico/runner.txt
           python - <<'PY' | tee diagnostico/payloads.txt
+          import hashlib
           from pathlib import Path
           from zipfile import ZipFile
 
@@ -68,6 +69,20 @@ jobs:
                   if not archive.read(name):
                       raise SystemExit(f'Binario vacio: {name}')
                   print(f'Bootstrap/base oficial: {name}')
+              # SHA-256 comparados byte a byte con OpenCore-1.0.6-RELEASE.zip.
+              # Digest oficial de ese ZIP: 3c34069ac72ef97f3602c119dcd4ba22c185251356c3094bff0c92dfb6ad0f28
+              expected = {
+                  'OpenCore-Build/EFI/OC/OpenCore.efi': '0a51419dda3f4555e4c472adc480a91310622194e1fdef3db536acf1ccb75ffe',
+                  'OpenCore-Build/System/Library/CoreServices/boot.efi': '59b63df1712b3ab42781ff78b39d30b991148f0711724d7987859425c65c86a4',
+                  'OpenCore-Build/EFI/OC/Drivers/OpenRuntime.efi': 'c88586f482e8948bfe69208ae77c0f6defbc7841852ded078c5ad2d0adee7ad0',
+              }
+              for name, digest in expected.items():
+                  if hashlib.sha256(archive.read(name)).hexdigest() != digest:
+                      raise SystemExit(f'Binario distinto de OpenCore 1.0.6 oficial: {name}')
+          validator_digest = hashlib.sha256((root / 'OpenCore/ocvalidate').read_bytes()).hexdigest()
+          if validator_digest != 'bb2be1660a286e23262c7b0bd3b517b305cdf7133715db60f47516d2c62bca43':
+              raise SystemExit('ocvalidate no coincide con OpenCore 1.0.6 oficial.')
+          print('OpenCore, bootstrap, OpenRuntime y ocvalidate: 1.0.6 RELEASE oficial.')
           PY
 
       - name: Instalar dependencias oficiales
@@ -169,20 +184,25 @@ jobs:
           config_path = checked_path(output, 'EFI/OC/config.plist')
           config = plistlib.loads(config_path.read_bytes())
           # OCLP agrega este override de Windows fuera de su modo de validacion.
-          # ocvalidate 1.0.4 lo rechaza por redundante (ValidateMisc.c).
+          # ocvalidate 1.0.6 lo rechaza por redundante (ValidateMisc.c).
           # Para este USB macOS se elimina SOLO esta entrada. Se valida el config
           # final real, sin ignorar errores ni validar una copia diferente.
           redundant = '\\EFI\\Microsoft\\Boot\\bootmgfw.efi'
           overrides = config['Misc']['BlessOverride']
           removed = overrides.count(redundant)
           config['Misc']['BlessOverride'] = [p for p in overrides if p != redundant]
-          config_path.write_bytes(plistlib.dumps(config, sort_keys=True))
           print(f'BlessOverride redundante de Windows eliminado: {removed}')
 
           revision = config['#Revision']
           require(revision['Original-Model'] == 'Macmini3,1', 'Modelo incorrecto.')
           require(revision['Build-Version'].startswith('2.5.1 - '), 'OCLP incorrecto.')
-          require(revision['OpenCore-Version'] == '1.0.4 - RELEASE', 'OpenCore incorrecto.')
+          declared_version = revision['OpenCore-Version']
+          require(declared_version == '1.0.4 - RELEASE', 'Etiqueta upstream inesperada.')
+          # El preflight comprueba los hashes de los binarios y del validador 1.0.6.
+          # Corrige solo este metadato desactualizado, sin cambiar ajustes de arranque.
+          revision['OpenCore-Version'] = '1.0.6 - RELEASE'
+          config_path.write_bytes(plistlib.dumps(config, sort_keys=True))
+          print('Metadato OpenCore corregido: 1.0.4 -> 1.0.6 (binarios oficiales verificados).')
           require(config['PlatformInfo']['DataHub']['BoardProduct'] == 'Mac-F22C86C8',
                   'Board ID incorrecto para Macmini3,1.')
           security = config['Misc']['Security']
@@ -253,13 +273,16 @@ jobs:
           report = {
               'model': 'Macmini3,1', 'board_id': 'Mac-F22C86C8',
               'oclp': '2.5.1', 'oclp_commit': os.environ['OCLP_COMMIT'],
-              'opencore': '1.0.4 RELEASE', 'runner_arch': 'x86_64',
+              'opencore': '1.0.6 RELEASE', 'oclp_declared_opencore': declared_version,
+              'opencore_official_release_sha256': '3c34069ac72ef97f3602c119dcd4ba22c185251356c3094bff0c92dfb6ad0f28',
+              'runner_arch': 'x86_64',
               'workflow_commit': os.environ['GITHUB_SHA'],
               'run_url': os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY']
                          + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
               'enabled_references': counts,
               'bootstrap_sha256': hashlib.sha256(boot.read_bytes()).hexdigest(),
-              'config_change': 'Remove only redundant Windows BlessOverride',
+              'config_changes': ['Remove redundant Windows BlessOverride',
+                                 'Correct #Revision/OpenCore-Version to the verified binary version 1.0.6'],
               'physical_mac_boot_tested': False,
           }
           (output / 'BUILD-INFO.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -277,7 +300,7 @@ jobs:
           cp diagnostico/ocvalidate.txt resultado/VALIDACION.txt
           cp diagnostico/python-packages.txt resultado/PYTHON-PACKAGES.txt
           cat > resultado/LEEME.txt <<'TXT'
-          Macmini3,1 - OCLP 2.5.1 / OpenCore 1.0.4 RELEASE - destino Big Sur
+          Macmini3,1 - OCLP 2.5.1 / OpenCore 1.0.6 RELEASE - destino Big Sur
 
           Extrae el artefacto ZIP en Windows. Copia EFI y System a la raiz del
           volumen FAT32 del USB. Debe quedar X:\EFI\BOOT\BOOTx64.efi,
@@ -300,8 +323,11 @@ jobs:
 
           System conserva el bootstrap nativo de OCLP; EFI/BOOT contiene una
           copia identica del mismo cargador para el arranque extraible UEFI.
-          Solo se elimina del config el BlessOverride redundante de Windows,
-          rechazado por ocvalidate. Los ajustes del modelo provienen de OCLP.
+          Del config se elimina el BlessOverride redundante de Windows,
+          rechazado por ocvalidate, y se corrige #Revision/OpenCore-Version a
+          1.0.6: OCLP 2.5.1 conserva una etiqueta 1.0.4 desactualizada aunque
+          sus binarios y ocvalidate coinciden con la publicacion oficial 1.0.6.
+          Los ajustes de hardware y parches del modelo provienen de OCLP.
           TXT
           python - <<'PY'
           import hashlib
