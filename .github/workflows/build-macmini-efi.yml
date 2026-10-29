@@ -1,0 +1,54 @@
+name: Construir EFI Macmini3,1
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-macmini-efi.yml'
+
+jobs:
+  build-efi:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Descargar OpenCore Legacy Patcher 2.5.1 oficial
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            https://github.com/dortania/OpenCore-Legacy-Patcher/releases/download/2.5.1/OpenCore-Patcher.pkg \
+            -o "$RUNNER_TEMP/OpenCore-Patcher.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/OpenCore-Patcher.pkg" -target /
+          test -x '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
+
+      - name: Construir OpenCore para Macmini3,1
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher' \
+            --build --model Macmini3,1 --disable_sip --disable_smb --verbose
+
+      - name: Preparar y verificar EFI generada
+        shell: bash
+        run: |
+          set -euo pipefail
+          EFI="$(sudo find /Applications /Users/Shared /Library /private/tmp \
+            -type d -path '*/OpenCore-Build/EFI' -print -quit 2>/dev/null)"
+          if [ -z "$EFI" ]; then
+            echo 'No se encontró la EFI generada por OCLP.' >&2
+            exit 1
+          fi
+          echo "EFI encontrada: $EFI"
+          sudo test -s "$EFI/OC/config.plist"
+          sudo test -s "$EFI/BOOT/BOOTx64.efi"
+          mkdir -p "$GITHUB_WORKSPACE/resultado"
+          sudo cp -R "$EFI" "$GITHUB_WORKSPACE/resultado/EFI"
+          sudo chown -R "$(id -un)" "$GITHUB_WORKSPACE/resultado"
+
+      - name: Publicar archivo descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: EFI-Macmini3-1-BigSur
+          path: resultado/EFI
+          if-no-files-found: error
+          retention-days: 7
