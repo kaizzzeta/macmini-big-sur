@@ -1,4 +1,4 @@
-name: Construir EFI Macmini3,1 (desde fuente)
+name: Construir EFI Macmini3,1 (v4 recursos persistentes)
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
           ref: 2.5.1
           path: oclp-src
 
-      - name: Preparar Python para ejecutar OCLP desde fuente
+      - name: Preparar Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --prefer-binary -r oclp-src/requirements.txt
 
-      - name: Instalar paquete oficial de OCLP para obtener payloads.dmg
+      - name: Instalar aplicacion oficial con los recursos de OCLP
         shell: bash
         run: |
           set -euo pipefail
@@ -41,22 +41,64 @@ jobs:
           sudo installer -pkg "$RUNNER_TEMP/OpenCore-Patcher.pkg" -target /
           test -x '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
 
-      - name: Montar recursos oficiales de OCLP en la carpeta del codigo fuente
+      - name: Conservar los recursos oficiales antes de que se desmonte la imagen
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="$(find '/Applications/OpenCore-Patcher.app' -name payloads.dmg -type f -print -quit)"
-          test -n "$IMAGE" || { echo 'ERROR: No se encontro payloads.dmg'; exit 1; }
-          echo "Imagen de recursos: $IMAGE"
-          mkdir -p "$GITHUB_WORKSPACE/oclp-src/payloads"
-          hdiutil attach "$IMAGE" -nobrowse -noverify \
-            -mountpoint "$GITHUB_WORKSPACE/oclp-src/payloads" \
-            -shadow "$RUNNER_TEMP/oclp-payloads-shadow" \
-            -passphrase password
-          test -f "$GITHUB_WORKSPACE/oclp-src/payloads/Config/config.plist"
-          test -f "$GITHUB_WORKSPACE/oclp-src/payloads/OpenCore/OpenCore-RELEASE.zip"
+          python - <<'PY'
+          import os, pathlib, signal, subprocess, sys, time
+          temp = pathlib.Path(os.environ['RUNNER_TEMP']) / 'oclp-payload-capture'
+          temp.mkdir(parents=True, exist_ok=True)
+          dest = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'oclp-src' / 'payloads'
+          logpath = temp / 'oclp-compiled.log'
+          exe = '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
+          env = os.environ.copy()
+          env['TMPDIR'] = str(temp) + '/'
+          print('Ejecutando OCLP empaquetado para montar sus recursos oficiales...', flush=True)
+          with open(logpath, 'wb') as logfile:
+              p = subprocess.Popen([exe, '--build', '--model', 'Macmini3,1', '--verbose'],
+                                   stdout=logfile, stderr=subprocess.STDOUT,
+                                   env=env, cwd=os.environ['GITHUB_WORKSPACE'])
+              resource_dir = None
+              stopped = False
+              try:
+                  for i in range(900):
+                      for cfg in temp.glob('tmp*/payloads/Config/config.plist'):
+                          candidate = cfg.parent.parent
+                          if (candidate / 'OpenCore/OpenCore-RELEASE.zip').is_file():
+                              resource_dir = candidate
+                              break
+                      if resource_dir is not None:
+                          break
+                      if p.poll() is not None:
+                          break
+                      time.sleep(0.1)
+                  if resource_dir is None:
+                      print('No se detecto el montaje de recursos.', flush=True)
+                      print(logpath.read_text(errors='replace')[-7000:], flush=True)
+                      raise SystemExit(1)
+                  os.kill(p.pid, signal.SIGSTOP)
+                  stopped = True
+                  print('Recursos montados en:', resource_dir, flush=True)
+                  print('Copiando recursos al checkout persistente...', flush=True)
+                  subprocess.run(['/usr/bin/ditto', str(resource_dir), str(dest)], check=True)
+                  for needed in ['Config/config.plist', 'OpenCore/OpenCore-RELEASE.zip']:
+                      assert (dest / needed).is_file(), f'Falta recurso: {needed}'
+                  print('Recursos conservados correctamente.', flush=True)
+              finally:
+                  if p.poll() is None:
+                      try:
+                          os.kill(p.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                  try:
+                      p.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      p.kill()
+                      p.wait()
+          PY
 
-      - name: Construir OpenCore para Macmini3,1 sin directorio temporal
+      - name: Construir EFI con OCLP desde fuente y verificar archivos
         shell: bash
         working-directory: oclp-src
         run: |
@@ -71,9 +113,7 @@ jobs:
           plutil -lint "$BUILD/OC/config.plist"
           mkdir -p "$GITHUB_WORKSPACE/resultado"
           ditto "$BUILD" "$GITHUB_WORKSPACE/resultado/EFI"
-          test -s "$GITHUB_WORKSPACE/resultado/EFI/OC/config.plist"
           du -sh "$GITHUB_WORKSPACE/resultado/EFI"
-          ls -lah "$GITHUB_WORKSPACE/resultado/EFI"
 
       - name: Publicar EFI descargable
         uses: actions/upload-artifact@v4
