@@ -1,3 +1,35 @@
+name: Construir EFI Macmini3,1 (corregido)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-macmini-efi.yml'
+
+jobs:
+  build-efi:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - name: Descargar e instalar OpenCore Legacy Patcher 2.5.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            'https://github.com/dortania/OpenCore-Legacy-Patcher/releases/download/2.5.1/OpenCore-Patcher.pkg' \
+            -o "$RUNNER_TEMP/OpenCore-Patcher.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/OpenCore-Patcher.pkg" -target /
+          test -x '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
+
+      - name: Construir y capturar EFI antes de que OCLP borre su carpeta temporal
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN='/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
+          TEMPROOT="$RUNNER_TEMP/oclp-temporary"
+          OUTPUT="$GITHUB_WORKSPACE/resultado/EFI"
+          LOG="$RUNNER_TEMP/oclp-build.log"
+          mkdir -p "$TEMPROOT" "$GITHUB_WORKSPACE/resultado"
           chmod 777 "$TEMPROOT"
 
           # La aplicación compilada de OCLP genera la EFI en una carpeta temporal.
