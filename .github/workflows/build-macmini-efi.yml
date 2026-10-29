@@ -1,51 +1,59 @@
-name: Construir EFI Macmini3,1
+          chmod 777 "$TEMPROOT"
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/build-macmini-efi.yml'
+          # La aplicación compilada de OCLP genera la EFI en una carpeta temporal.
+          # Se captura mientras el proceso sigue activo, antes de su limpieza automática.
+          sudo env TMPDIR="$TEMPROOT/" "$BIN" \
+            --build --model Macmini3,1 --disable_sip --disable_smb --verbose \
+            > "$LOG" 2>&1 &
+          BUILD_PID=$!
+          COPIED=0
+          for (( i=0; i<1200; i++ )); do
+            CONFIG="$(sudo find "$TEMPROOT" -type f \
+              -path '*/Build-Folder/OpenCore-Build/EFI/OC/config.plist' \
+              -print -quit 2>/dev/null || true)"
+            if [ -n "$CONFIG" ]; then
+              SRC="${CONFIG%/OC/config.plist}"
+              # Repetimos la copia para incluir archivos que OCLP genere al final.
+              sudo ditto "$SRC" "$OUTPUT" 2>/dev/null || true
+              if [ -s "$OUTPUT/OC/config.plist" ] && \
+                 [ -s "$OUTPUT/BOOT/BOOTx64.efi" ] && \
+                 [ -s "$OUTPUT/OC/OpenCore.efi" ]; then
+                COPIED=1
+              fi
+            fi
+            if ! kill -0 "$BUILD_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
 
-jobs:
-  build-efi:
-    runs-on: macos-15-intel
-    timeout-minutes: 30
-    steps:
-      - name: Descargar OpenCore Legacy Patcher 2.5.1 oficial
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fL --retry 3 \
-            https://github.com/dortania/OpenCore-Legacy-Patcher/releases/download/2.5.1/OpenCore-Patcher.pkg \
-            -o "$RUNNER_TEMP/OpenCore-Patcher.pkg"
-          sudo installer -pkg "$RUNNER_TEMP/OpenCore-Patcher.pkg" -target /
-          test -x '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
+          set +e
+          wait "$BUILD_PID"
+          BUILD_EXIT=$?
+          set -e
+          echo '=== Extracto del registro de OCLP ==='
+          tail -n 100 "$LOG" || true
+          echo "Código de salida de OCLP: $BUILD_EXIT"
+          echo "EFI capturada durante el proceso: $COPIED"
 
-      - name: Construir OpenCore para Macmini3,1
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher' \
-            --build --model Macmini3,1 --disable_sip --disable_smb --verbose
-
-      - name: Preparar y verificar EFI generada
-        shell: bash
-        run: |
-          set -euo pipefail
-          EFI="$(sudo find /Applications /Users/Shared /Library /private/tmp \
-            -type d -path '*/OpenCore-Build/EFI' -print -quit 2>/dev/null)"
-          if [ -z "$EFI" ]; then
-            echo 'No se encontró la EFI generada por OCLP.' >&2
+          if [ "$BUILD_EXIT" -ne 0 ]; then
+            echo 'ERROR: OCLP devolvió un código distinto de cero.' >&2
             exit 1
           fi
-          echo "EFI encontrada: $EFI"
-          sudo test -s "$EFI/OC/config.plist"
-          sudo test -s "$EFI/BOOT/BOOTx64.efi"
-          mkdir -p "$GITHUB_WORKSPACE/resultado"
-          sudo cp -R "$EFI" "$GITHUB_WORKSPACE/resultado/EFI"
+          if [ "$COPIED" -ne 1 ]; then
+            echo 'ERROR: No se logró conservar una EFI completa antes del cierre.' >&2
+            exit 1
+          fi
           sudo chown -R "$(id -un)" "$GITHUB_WORKSPACE/resultado"
+          test -s "$OUTPUT/OC/config.plist"
+          test -s "$OUTPUT/BOOT/BOOTx64.efi"
+          test -s "$OUTPUT/OC/OpenCore.efi"
+          plutil -lint "$OUTPUT/OC/config.plist"
+          echo '=== EFI final ==='
+          du -sh "$OUTPUT"
+          ls -la "$OUTPUT/OC"
 
-      - name: Publicar archivo descargable
+      - name: Publicar EFI descargable
         uses: actions/upload-artifact@v4
         with:
           name: EFI-Macmini3-1-BigSur
