@@ -1,4 +1,4 @@
-name: Construir EFI Macmini3,1 (v4 recursos persistentes)
+name: Construir EFI Macmini3,1 - OCLP 2.5.1
 
 on:
   workflow_dispatch:
@@ -6,119 +6,371 @@ on:
     paths:
       - '.github/workflows/build-macmini-efi.yml'
 
+permissions:
+  contents: read
+
 jobs:
   build-efi:
     runs-on: macos-15-intel
-    timeout-minutes: 45
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      OCLP_COMMIT: f40057a5292f4804b51bcfe78d5047c7302a6434
+      PYTHONUNBUFFERED: '1'
+
     steps:
-      - name: Obtener codigo fuente oficial de OCLP 2.5.1
-        uses: actions/checkout@v4
+      - name: Obtener OCLP 2.5.1 y sus recursos oficiales
+        uses: actions/checkout@v6
         with:
           repository: dortania/OpenCore-Legacy-Patcher
-          ref: 2.5.1
+          # Commit del tag 2.5.1: incluye payloads, OpenCore 1.0.4 y ocvalidate.
+          ref: f40057a5292f4804b51bcfe78d5047c7302a6434
           path: oclp-src
+          persist-credentials: false
 
-      - name: Preparar Python 3.11
-        uses: actions/setup-python@v5
+      - name: Preparar Python 3.11 Intel
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           architecture: x64
 
-      - name: Instalar dependencias oficiales
-        shell: bash
+      - name: Verificar runner y recursos persistentes
         run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install --prefer-binary -r oclp-src/requirements.txt
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "::error::Linea %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+          mkdir -p diagnostico
+          test "$(uname -m)" = x86_64
+          test "$(git -C oclp-src rev-parse HEAD)" = "$OCLP_COMMIT"
+          sw_vers | tee diagnostico/runner.txt
+          python --version | tee -a diagnostico/runner.txt
+          python - <<'PY' | tee diagnostico/payloads.txt
+          from pathlib import Path
+          from zipfile import ZipFile
 
-      - name: Instalar aplicacion oficial con los recursos de OCLP
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fL --retry 3 \
-            'https://github.com/dortania/OpenCore-Legacy-Patcher/releases/download/2.5.1/OpenCore-Patcher.pkg' \
-            -o "$RUNNER_TEMP/OpenCore-Patcher.pkg"
-          sudo installer -pkg "$RUNNER_TEMP/OpenCore-Patcher.pkg" -target /
-          test -x '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
-
-      - name: Conservar los recursos oficiales antes de que se desmonte la imagen
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os, pathlib, signal, subprocess, sys, time
-          temp = pathlib.Path(os.environ['RUNNER_TEMP']) / 'oclp-payload-capture'
-          temp.mkdir(parents=True, exist_ok=True)
-          dest = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'oclp-src' / 'payloads'
-          logpath = temp / 'oclp-compiled.log'
-          exe = '/Applications/OpenCore-Patcher.app/Contents/MacOS/OpenCore-Patcher'
-          env = os.environ.copy()
-          env['TMPDIR'] = str(temp) + '/'
-          print('Ejecutando OCLP empaquetado para montar sus recursos oficiales...', flush=True)
-          with open(logpath, 'wb') as logfile:
-              p = subprocess.Popen([exe, '--build', '--model', 'Macmini3,1', '--verbose'],
-                                   stdout=logfile, stderr=subprocess.STDOUT,
-                                   env=env, cwd=os.environ['GITHUB_WORKSPACE'])
-              resource_dir = None
-              stopped = False
-              try:
-                  for i in range(900):
-                      for cfg in temp.glob('tmp*/payloads/Config/config.plist'):
-                          candidate = cfg.parent.parent
-                          if (candidate / 'OpenCore/OpenCore-RELEASE.zip').is_file():
-                              resource_dir = candidate
-                              break
-                      if resource_dir is not None:
-                          break
-                      if p.poll() is not None:
-                          break
-                      time.sleep(0.1)
-                  if resource_dir is None:
-                      print('No se detecto el montaje de recursos.', flush=True)
-                      print(logpath.read_text(errors='replace')[-7000:], flush=True)
-                      raise SystemExit(1)
-                  os.kill(p.pid, signal.SIGSTOP)
-                  stopped = True
-                  print('Recursos montados en:', resource_dir, flush=True)
-                  print('Copiando recursos al checkout persistente...', flush=True)
-                  subprocess.run(['/usr/bin/ditto', str(resource_dir), str(dest)], check=True)
-                  for needed in ['Config/config.plist', 'OpenCore/OpenCore-RELEASE.zip']:
-                      assert (dest / needed).is_file(), f'Falta recurso: {needed}'
-                  print('Recursos conservados correctamente.', flush=True)
-              finally:
-                  if p.poll() is None:
-                      try:
-                          os.kill(p.pid, signal.SIGKILL)
-                      except ProcessLookupError:
-                          pass
-                  try:
-                      p.wait(timeout=10)
-                  except subprocess.TimeoutExpired:
-                      p.kill()
-                      p.wait()
+          root = Path('oclp-src/payloads')
+          for name in ('Config/config.plist', 'OpenCore/OpenCore-RELEASE.zip',
+                       'OpenCore/ocvalidate', 'Icon/Resources.zip'):
+              path = root / name
+              if not path.is_file() or path.stat().st_size == 0:
+                  raise SystemExit(f'Recurso oficial ausente o vacio: {path}')
+          archives = sorted(root.rglob('*.zip'))
+          for path in archives:
+              with ZipFile(path) as archive:
+                  bad = archive.testzip()
+                  if bad:
+                      raise SystemExit(f'CRC incorrecto: {path}: {bad}')
+          print(f'CRC correcto en {len(archives)} archivos ZIP oficiales.')
+          with ZipFile(root / 'OpenCore/OpenCore-RELEASE.zip') as archive:
+              for name in ('OpenCore-Build/EFI/OC/OpenCore.efi',
+                           'OpenCore-Build/System/Library/CoreServices/boot.efi'):
+                  if not archive.read(name):
+                      raise SystemExit(f'Binario vacio: {name}')
+                  print(f'Bootstrap/base oficial: {name}')
           PY
 
-      - name: Construir EFI con OCLP desde fuente y verificar archivos
-        shell: bash
+      - name: Instalar dependencias oficiales
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --prefer-binary -r oclp-src/requirements.txt
+          python -m pip freeze > diagnostico/python-packages.txt
+
+      - name: Construir EFI desde fuente sin montajes temporales
         working-directory: oclp-src
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "::error::Linea %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+          # La CLI reestablece SIP/SecureBootModel si se omiten estos flags.
+          # Son necesarios para los root patches de la GPU Tesla de este modelo.
           python OpenCore-Patcher-GUI.command \
-            --build --model Macmini3,1 --disable_sip --disable_smb --verbose
-          BUILD="$PWD/Build-Folder/OpenCore-Build/EFI"
-          echo "EFI creada en: $BUILD"
-          test -s "$BUILD/OC/config.plist"
-          test -s "$BUILD/OC/OpenCore.efi"
-          test -s "$BUILD/BOOT/BOOTx64.efi"
-          plutil -lint "$BUILD/OC/config.plist"
-          mkdir -p "$GITHUB_WORKSPACE/resultado"
-          ditto "$BUILD" "$GITHUB_WORKSPACE/resultado/EFI"
-          du -sh "$GITHUB_WORKSPACE/resultado/EFI"
+            --build --model Macmini3,1 --disable_sip --disable_smb --verbose \
+            2>&1 | tee ../diagnostico/oclp-build.log
 
-      - name: Publicar EFI descargable
+      - name: Registrar salida original y reproducir las comprobaciones de v4
+        run: |
+          set -Eeuo pipefail
+          BUILD="$GITHUB_WORKSPACE/oclp-src/Build-Folder/OpenCore-Build"
+          test -d "$BUILD"
+          find "$BUILD" -type f | sort > diagnostico/arbol-original.txt
+          # Estos tests diagnosticos registran el codigo de cada comprobacion.
+          # La validacion estricta de la EFI final se realiza a continuacion.
+          for rel in EFI/OC/config.plist EFI/OC/OpenCore.efi EFI/BOOT/BOOTx64.efi System/Library/CoreServices/boot.efi; do
+            if test -s "$BUILD/$rel"; then rc=0; else rc=$?; fi
+            printf 'test -s %s => exit %s\n' "$rel" "$rc"
+          done | tee diagnostico/tests-v4.txt
+          cp "$BUILD/EFI/OC/config.plist" diagnostico/config-original.plist
+
+      - name: Preservar salida, preparar bootstrap y validar todos los recursos
+        run: |
+          set -Eeuo pipefail
+          trap 'rc=$?; printf "::error::Linea %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+          python - <<'PY' | tee diagnostico/validacion-archivos.txt
+          import hashlib
+          import json
+          import os
+          import plistlib
+          import shutil
+          import struct
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+
+          source = Path('oclp-src/Build-Folder/OpenCore-Build')
+          output = Path('resultado')
+          if output.exists():
+              raise SystemExit('resultado ya existe: no se mezclan builds.')
+          shutil.copytree(source, output)
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def checked_path(base, name, directory=False):
+              # Comprueba mayusculas incluso si el runner usa APFS insensible al caso.
+              rel = PurePosixPath(name.replace('\\', '/'))
+              require(bool(name) and not rel.is_absolute() and '..' not in rel.parts,
+                      f'Ruta relativa invalida: {name!r}')
+              path = base
+              for part in rel.parts:
+                  require(path.is_dir() and part in {p.name for p in path.iterdir()},
+                          f'Falta ruta o difiere el uso de mayusculas: {path / part}')
+                  path = path / part
+                  require(not path.is_symlink(), f'Enlace no portable a FAT32: {path}')
+              if directory:
+                  require(path.is_dir(), f'Falta directorio: {path}')
+              else:
+                  require(path.is_file() and path.stat().st_size > 0,
+                          f'Falta archivo o esta vacio: {path}')
+              return path
+
+          def pe_x64(path):
+              data = path.read_bytes()
+              require(len(data) >= 64 and data[:2] == b'MZ', f'No es PE: {path}')
+              offset = struct.unpack_from('<I', data, 0x3c)[0]
+              require(offset + 26 <= len(data), f'Cabecera PE truncada: {path}')
+              require(data[offset:offset + 4] == b'PE\0\0', f'Firma PE invalida: {path}')
+              require(struct.unpack_from('<H', data, offset + 4)[0] == 0x8664,
+                      f'Binario EFI no x86_64: {path}')
+
+          native = checked_path(output, 'System/Library/CoreServices/boot.efi')
+          opencore = checked_path(output, 'EFI/OC/OpenCore.efi')
+          # OCLP empaqueta BOOTx64.efi renombrado como System/.../boot.efi.
+          # No debe sustituirse por OpenCore.efi: son binarios diferentes.
+          with ZipFile('oclp-src/payloads/OpenCore/OpenCore-RELEASE.zip') as archive:
+              for path in (native, opencore):
+                  member = 'OpenCore-Build/' + path.relative_to(output).as_posix()
+                  require(path.read_bytes() == archive.read(member),
+                          f'El binario no coincide con OCLP 2.5.1: {path}')
+          boot = output / 'EFI/BOOT/BOOTx64.efi'
+          require(not boot.exists(), 'Bootstrap inesperado; revisar estructura upstream.')
+          boot.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(native, boot)
+
+          config_path = checked_path(output, 'EFI/OC/config.plist')
+          config = plistlib.loads(config_path.read_bytes())
+          # OCLP agrega este override de Windows fuera de su modo de validacion.
+          # ocvalidate 1.0.4 lo rechaza por redundante (ValidateMisc.c).
+          # Para este USB macOS se elimina SOLO esta entrada. Se valida el config
+          # final real, sin ignorar errores ni validar una copia diferente.
+          redundant = '\\EFI\\Microsoft\\Boot\\bootmgfw.efi'
+          overrides = config['Misc']['BlessOverride']
+          removed = overrides.count(redundant)
+          config['Misc']['BlessOverride'] = [p for p in overrides if p != redundant]
+          config_path.write_bytes(plistlib.dumps(config, sort_keys=True))
+          print(f'BlessOverride redundante de Windows eliminado: {removed}')
+
+          revision = config['#Revision']
+          require(revision['Original-Model'] == 'Macmini3,1', 'Modelo incorrecto.')
+          require(revision['Build-Version'].startswith('2.5.1 - '), 'OCLP incorrecto.')
+          require(revision['OpenCore-Version'] == '1.0.4 - RELEASE', 'OpenCore incorrecto.')
+          require(config['PlatformInfo']['DataHub']['BoardProduct'] == 'Mac-F22C86C8',
+                  'Board ID incorrecto para Macmini3,1.')
+          security = config['Misc']['Security']
+          require(security['SecureBootModel'] == 'Disabled', 'SecureBootModel incorrecto.')
+          require(security['DmgLoading'] == 'Signed', 'La recuperacion debe estar firmada.')
+          require(security['Vault'] == 'Optional', 'Vault inesperado.')
+          apple_nvram = config['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']
+          require(apple_nvram['csr-active-config'] == bytes.fromhex('03080000'),
+                  'SIP no coincide con los root patches de OCLP.')
+          require(config['UEFI']['APFS']['EnableJumpstart'], 'APFS Jumpstart desactivado.')
+
+          for rel in ('EFI/BOOT/BOOTx64.efi', 'EFI/OC/OpenCore.efi',
+                      'System/Library/CoreServices/boot.efi'):
+              pe_x64(checked_path(output, rel))
+          oc = output / 'EFI/OC'
+          counts = {}
+          for section, key, folder in (('ACPI', 'Add', 'ACPI'),
+                                       ('UEFI', 'Drivers', 'Drivers'),
+                                       ('Misc', 'Tools', 'Tools')):
+              entries = [e for e in config[section][key] if e.get('Enabled', True)]
+              counts[f'{section}/{key}'] = len(entries)
+              for entry in entries:
+                  path = checked_path(oc / folder, entry['Path'])
+                  if path.suffix.lower() == '.efi':
+                      pe_x64(path)
+
+          kexts = [k for k in config['Kernel']['Add'] if k['Enabled']]
+          counts['Kernel/Add'] = len(kexts)
+          for kext in kexts:
+              bundle = checked_path(oc / 'Kexts', kext['BundlePath'], directory=True)
+              info_path = checked_path(bundle, kext['PlistPath'])
+              info = plistlib.loads(info_path.read_bytes())
+              # Kexts de inyeccion: ExecutablePath puede ser ''.
+              executable = kext['ExecutablePath']
+              if executable:
+                  checked_path(bundle, executable)
+              if info.get('CFBundleExecutable'):
+                  checked_path(bundle, 'Contents/MacOS/' + info['CFBundleExecutable'])
+
+          resources = oc / 'Resources'
+          if config['Misc']['Boot']['PickerMode'] == 'External':
+              for folder in ('Audio', 'Font', 'Image', 'Label'):
+                  directory = checked_path(resources, folder, directory=True)
+                  require(any(p.is_file() and p.stat().st_size for p in directory.rglob('*')),
+                          f'Recursos vacios: {directory}')
+              checked_path(resources / 'Image', config['Misc']['Boot']['PickerVariant'], directory=True)
+              # Compara todos los recursos de OpenCanopy con el ZIP oficial.
+              with ZipFile('oclp-src/payloads/Icon/Resources.zip') as archive:
+                  for member in archive.infolist():
+                      if member.is_dir() or not member.filename.startswith('Resources/'):
+                          continue
+                      path = checked_path(oc, member.filename)
+                      require(path.read_bytes() == archive.read(member),
+                              f'Recurso de OpenCanopy alterado: {path}')
+
+          for path in output.rglob('*'):
+              require(not path.is_symlink(), f'Enlace no portable: {path}')
+              if path.is_file() and path.suffix == '.plist':
+                  plistlib.loads(path.read_bytes())
+          # Confirma que no se perdio ningun archivo original al preparar el USB.
+          for path in source.rglob('*'):
+              if path.is_file():
+                  relative = path.relative_to(source)
+                  target = checked_path(output, relative.as_posix())
+                  if relative.as_posix() != 'EFI/OC/config.plist':
+                      require(target.read_bytes() == path.read_bytes(), f'Copia alterada: {relative}')
+
+          report = {
+              'model': 'Macmini3,1', 'board_id': 'Mac-F22C86C8',
+              'oclp': '2.5.1', 'oclp_commit': os.environ['OCLP_COMMIT'],
+              'opencore': '1.0.4 RELEASE', 'runner_arch': 'x86_64',
+              'workflow_commit': os.environ['GITHUB_SHA'],
+              'run_url': os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY']
+                         + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+              'enabled_references': counts,
+              'bootstrap_sha256': hashlib.sha256(boot.read_bytes()).hexdigest(),
+              'config_change': 'Remove only redundant Windows BlessOverride',
+              'physical_mac_boot_tested': False,
+          }
+          (output / 'BUILD-INFO.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          print('OK: bootstrap x64, OpenCore, config, rutas, kexts y recursos verificados.')
+          PY
+          plutil -lint resultado/EFI/OC/config.plist
+          chmod +x oclp-src/payloads/OpenCore/ocvalidate
+          oclp-src/payloads/OpenCore/ocvalidate resultado/EFI/OC/config.plist \
+            2>&1 | tee diagnostico/ocvalidate.txt
+
+      - name: Crear instrucciones, hashes y comprobar paquete final
+        run: |
+          set -Eeuo pipefail
+          cp diagnostico/ocvalidate.txt resultado/VALIDACION.txt
+          cp diagnostico/python-packages.txt resultado/PYTHON-PACKAGES.txt
+          cat > resultado/LEEME.txt <<'TXT'
+          Macmini3,1 - OCLP 2.5.1 / OpenCore 1.0.4 RELEASE - destino Big Sur
+
+          Extrae el artefacto ZIP en Windows. Copia EFI y System a la raiz del
+          volumen FAT32 del USB. Debe quedar X:\EFI\BOOT\BOOTx64.efi,
+          X:\EFI\OC\config.plist y X:\System\Library\CoreServices\boot.efi.
+          No debe quedar X:\EFI\EFI ni X:\resultado\EFI.
+          Conserva X:\com.apple.recovery.boot\BaseSystem.dmg y BaseSystem.chunklist.
+          No mezcles esta EFI con otra version de OpenCore.
+
+          Arranca la Mac con Option/Alt, selecciona EFI Boot y luego Recovery.
+          Si Recovery esta oculta, pulsa Espacio dentro del selector de OpenCore.
+          La recuperacion necesita Internet; usa Ethernet si es posible.
+          Tras cada reinicio, entra por OpenCore y elige el instalador o el disco
+          interno que corresponda. Tras instalar, ejecuta OCLP 2.5.1 en la Mac
+          para aplicar Post-Install Root Patch y despues instala OpenCore al disco.
+
+          Esta EFI no actualiza el firmware ni incluye parches del volumen macOS.
+          NVIDIA 9400M requiere root patches; no adquiere soporte Metal.
+          2 GB esta por debajo del requisito oficial de 4 GB para Big Sur.
+          Una EFI validada en CI no garantiza el arranque fisico de esta Mac.
+
+          System conserva el bootstrap nativo de OCLP; EFI/BOOT contiene una
+          copia identica del mismo cargador para el arranque extraible UEFI.
+          Solo se elimina del config el BlessOverride redundante de Windows,
+          rechazado por ocvalidate. Los ajustes del modelo provienen de OCLP.
+          TXT
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          root = Path('resultado')
+          report_path = root / 'BUILD-INFO.json'
+          report = json.loads(report_path.read_text())
+          report['ocvalidate'] = 'passed on the delivered config.plist'
+          report_path.write_text(json.dumps(report, indent=2) + '\n')
+          hashes = []
+          for path in sorted(root.rglob('*')):
+              if path.is_file():
+                  hashes.append(hashlib.sha256(path.read_bytes()).hexdigest()
+                                + '  ' + path.relative_to(root).as_posix())
+          (root / 'SHA256SUMS.txt').write_text('\n'.join(hashes) + '\n')
+          # Prueba de empaquetado: EFI/ y System/ quedan en la raiz del ZIP.
+          with TemporaryDirectory() as temp:
+              archive_path = Path(temp) / 'test.zip'
+              with ZipFile(archive_path, 'w', ZIP_DEFLATED) as archive:
+                  for path in sorted(root.rglob('*')):
+                      if path.is_file():
+                          archive.write(path, path.relative_to(root).as_posix())
+              with ZipFile(archive_path) as archive:
+                  if archive.testzip():
+                      raise SystemExit('Error CRC en el paquete final.')
+                  for line in hashes:
+                      expected, name = line.split('  ', 1)
+                      if hashlib.sha256(archive.read(name)).hexdigest() != expected:
+                          raise SystemExit(f'Hash incorrecto en ZIP: {name}')
+          print(f'Paquete comprobado: {len(hashes)} archivos con SHA-256.')
+          PY
+
+      - name: Publicar EFI completa lista para copiar
+        id: artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EFI-Macmini3-1-BigSur
-          path: resultado/EFI/
+          name: EFI-Macmini3-1-BigSur-OCLP-2.5.1
+          # Subir el padre conserva EFI/ en el ZIP; resultado/EFI/ la eliminaria.
+          path: resultado/
+          include-hidden-files: true
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Resumen de la ejecucion
+        env:
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: |
+          {
+            echo 'EFI de Macmini3,1 generada y validada con OCLP 2.5.1.'
+            echo
+            echo "[Descargar EFI]($ARTIFACT_URL)"
+            echo
+            echo 'Copiar EFI/ y System/ a la raiz del USB; conservar com.apple.recovery.boot/.'
+            echo 'Verificados bootstrap x64, config final con ocvalidate, recursos y SHA-256.'
+            echo 'Pendiente: probar en la Mac fisica; 2 GB no cumplen el requisito oficial de Big Sur.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar diagnostico incluso si falla la validacion
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diagnostico-Macmini3-1
+          path: |
+            diagnostico/
+            oclp-src/Build-Folder/OpenCore-Build/
+          include-hidden-files: true
+          if-no-files-found: warn
           retention-days: 7
